@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Live GPS -> Map (JS only)</title>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-sA+q3s8bNf1Y2b0n4g5QqkQv8g0q3gX6k8m0s8v+YPI=" crossorigin="" />
+
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            font-family: system-ui, Segoe UI, Roboto, Arial;
+        }
+
+        #app {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        #topbar {
+            display: flex;
+            gap: .5rem;
+            padding: .5rem;
+            align-items: center;
+            background: linear-gradient(90deg, #fff, #f6f8fb);
+            border-bottom: 1px solid #e3e7ee;
+        }
+
+        button {
+            padding: .45rem .7rem;
+            border-radius: 8px;
+            border: 1px solid #ccd6e6;
+            background: #fff;
+            cursor: pointer;
+        }
+
+        button:active {
+            transform: translateY(1px);
+        }
+
+        #info {
+            margin-left: auto;
+            font-size: 0.9rem;
+            color: #111827;
+        }
+
+        #map {
+            flex: 1 1 auto;
+            min-height: 0;
+        }
+
+        #panel {
+            position: absolute;
+            right: 10px;
+            top: 70px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            padding: .6rem;
+            border-radius: 8px;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+            font-size: 0.9rem;
+            max-width: 320px;
+        }
+
+        .stat {
+            margin: .2rem 0;
+        }
+
+        .muted {
+            color: #6b7280;
+            font-size: 0.85rem;
+        }
+
+        pre {
+            margin: 0;
+            font-family: monospace;
+            font-size: 0.86rem;
+        }
+
+        .controls {
+            display: flex;
+            gap: .5rem;
+            align-items: center;
+        }
+
+        @media (max-width:600px) {
+            #panel {
+                left: 8px;
+                right: 8px;
+                top: auto;
+                bottom: 10px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <div id="topbar">
+            <strong>Live GPS → Map (JS only)</strong>
+            <div class="controls">
+                <button id="btnStart">Start</button>
+                <button id="btnStop" disabled>Stop</button>
+                <button id="btnCenter" disabled>Center</button>
+                <button id="btnExport" disabled>Export CSV</button>
+            </div>
+            <div id="info" class="muted">Needs HTTPS. Works on mobile browsers (allow location).</div>
+        </div>
+
+        <div id="map"></div>
+
+        <div id="panel" aria-live="polite">
+            <div class="stat"><strong>Position</strong></div>
+            <div class="stat">Lat / Lon:
+                <pre id="latlon">—</pre>
+            </div>
+            <div class="stat">Accuracy: <span id="accuracy">—</span> meters</div>
+            <div class="stat">Speed: <span id="speed">—</span></div>
+            <div class="stat">Heading: <span id="heading">—</span></div>
+            <div class="stat">Timestamp: <span id="ts">—</span></div>
+            <div class="stat muted">Messages: <span id="msg">idle</span></div>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-o9N1j6kM2h7u8XGkZTU6Xk9UY5xkF1k9K2mQ3Z5n6uM=" crossorigin=""></script>
+
+    <script>
+        (function () {
+            // Map setup
+            const map = L.map('map', { zoomControl: true }).setView([20.5937, 78.9629], 5); // default: india center
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            // UI elements
+            const btnStart = document.getElementById('btnStart');
+            const btnStop = document.getElementById('btnStop');
+            const btnCenter = document.getElementById('btnCenter');
+            const btnExport = document.getElementById('btnExport');
+            const latlonEl = document.getElementById('latlon');
+            const accEl = document.getElementById('accuracy');
+            const speedEl = document.getElementById('speed');
+            const headingEl = document.getElementById('heading');
+            const tsEl = document.getElementById('ts');
+            const msgEl = document.getElementById('msg');
+
+            let watchId = null;
+            let marker = null;
+            let accuracyCircle = null;
+            let path = L.polyline([], { weight: 4, opacity: 0.9 }).addTo(map);
+            let positions = []; // store {lat,lng,accuracy,timestamp, speed, heading}
+
+            const startTracking = () => {
+                if (!('geolocation' in navigator)) {
+                    msg('Geolocation not supported by this browser');
+                    return;
+                }
+
+                msg('Requesting location permission...');
+                btnStart.disabled = true;
+
+                const options = {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,
+                    timeout: 10000
+                };
+
+                watchId = navigator.geolocation.watchPosition(onPosition, onError, options);
+                btnStop.disabled = false;
+                btnCenter.disabled = false;
+                btnExport.disabled = false;
+                msg('Tracking started — allow location access on your device if prompted.');
+            };
+
+            const stopTracking = () => {
+                if (watchId !== null) {
+                    navigator.geolocation.clearWatch(watchId);
+                    watchId = null;
+                    msg('Tracking stopped.');
+                    btnStart.disabled = false;
+                    btnStop.disabled = true;
+                }
+            };
+
+            const onPosition = (pos) => {
+                const { latitude: lat, longitude: lng, accuracy, heading, speed } = pos.coords;
+                const ts = new Date(pos.timestamp);
+
+                // Save position
+                positions.push({ lat, lng, accuracy, heading: heading ?? null, speed: speed ?? null, timestamp: pos.timestamp });
+
+                // Update marker
+                if (!marker) {
+                    marker = L.marker([lat, lng], { title: 'You' }).addTo(map);
+                } else {
+                    marker.setLatLng([lat, lng]);
+                }
+
+                // Accuracy circle
+                if (accuracyCircle) accuracyCircle.setLatLng([lat, lng]).setRadius(accuracy);
+                else accuracyCircle = L.circle([lat, lng], { radius: accuracy, fillOpacity: 0.08 }).addTo(map);
+
+                // Path (polyline)
+                path.addLatLng([lat, lng]);
+
+                // Update UI
+                latlonEl.textContent = lat.toFixed(6) + ' , ' + lng.toFixed(6);
+                accEl.textContent = Math.round(accuracy) + ' m';
+                speedEl.textContent = speed == null ? '—' : (speed * 3.6).toFixed(2) + ' km/h';
+                headingEl.textContent = heading == null ? '—' : Math.round(heading) + '°';
+                tsEl.textContent = ts.toLocaleString();
+
+                // Auto center if user clicked center button previously or first fix
+                // Keep a little logic: if map is far away (>1km) or first fix, center
+                try {
+                    const center = map.getCenter();
+                    const d = map.distance(center, L.latLng(lat, lng));
+                    if (positions.length === 1 || d > 1000) map.setView([lat, lng], 18);
+                } catch (e) { }
+
+                msg('Got location — updated map.');
+            };
+
+            const onError = (err) => {
+                console.error('Geolocation error', err);
+                switch (err.code) {
+                    case 1: msg('Permission denied. Allow location access and reload.'); break;
+                    case 2: msg('Position unavailable.'); break;
+                    case 3: msg('Timeout getting position.'); break;
+                    default: msg('Unknown geolocation error: ' + err.message);
+                }
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+            };
+
+            function msg(s) { msgEl.textContent = s; }
+
+            // Center map on current marker
+            btnCenter.addEventListener('click', () => {
+                if (!marker) { msg('No location yet. Start tracking.'); return; }
+                map.setView(marker.getLatLng(), 18);
+                msg('Centered map on you.');
+            });
+
+            // Start / Stop buttons
+            btnStart.addEventListener('click', () => startTracking());
+            btnStop.addEventListener('click', () => stopTracking());
+
+            // Export CSV (simple)
+            btnExport.addEventListener('click', () => {
+                if (!positions.length) { msg('No positions to export.'); return; }
+                const rows = [['timestamp_ms', 'iso', 'lat', 'lng', 'accuracy_m', 'speed_m_s', 'heading_deg']];
+                for (const p of positions) {
+                    rows.push([
+                        p.timestamp,
+                        new Date(p.timestamp).toISOString(),
+                        p.lat, p.lng,
+                        p.accuracy,
+                        p.speed == null ? '' : p.speed,
+                        p.heading == null ? '' : p.heading
+                    ]);
+                }
+                const csv = rows.map(r => r.map(cell => ('' + cell).replace(/"/g, '""')).map(c => `"${c}"`).join(',')).join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'positions.csv';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                msg('Exported CSV with ' + positions.length + ' points.');
+            });
+
+            // Helpful keyboard shortcuts for desktop testing
+            window.addEventListener('keydown', (e) => {
+                if (e.key === 's') startTracking();
+                if (e.key === 'x') stopTracking();
+            });
+
+            // Optional: start automatically if user wants (commented)
+            startTracking();
+
+        })();
+    </script>
+</body>
+
+</html>
